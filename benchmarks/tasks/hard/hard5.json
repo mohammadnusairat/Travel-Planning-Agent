@@ -1,0 +1,100 @@
+{
+  "task_id": "task_020",
+  "difficulty": "hard",
+  "title": "Multi-City Wedding Weekend with Flight Cancellations and Hotel Rebooking Crisis",
+  "scenario": {
+    "description": "A wedding party of 8 guests is traveling for a 4-day multi-city celebration: San Francisco → Las Vegas → Lake Tahoe → San Francisco. The group needs coordinated transportation across three cities with specific hotel and flight combinations. Thursday night bachelor party in Las Vegas, Friday morning flight to Reno for the rehearsal and dinner in Lake Tahoe (45-min drive from RNO), Saturday wedding ceremony and reception in Lake Tahoe, Sunday post-wedding brunch and return flight to SFO. Severe morning fog at SFO causes the Thursday morning flight to Las Vegas to be cancelled, forcing a last-minute expensive rebooking, followed by a sudden hotel closure in Tahoe.",
+    "origin_city": "San Francisco",
+    "destination_cities": ["Las Vegas", "Lake Tahoe"],
+    "trip_duration_days": 4
+  },
+  "user_profile": {
+    "party_size": 8,
+    "traveler_types": ["adult", "adult", "adult", "adult", "adult", "adult", "adult", "adult"],
+    "special_needs": []
+  },
+  "initial_constraints": {
+    "hard": {
+      "budget_max": 12000,
+      "departure_date": "2026-07-09",
+      "return_date": "2026-07-12",
+      "flight_requirements": {
+        "outbound_thursday": "SFO → LAS (preferred 8 AM or 10 AM departure)",
+        "mid_trip_friday": "LAS → RNO (morning departure to arrive by noon)",
+        "return_sunday": "RNO → SFO (afternoon departure after brunch)"
+      },
+      "hotel_requirements": {
+        "thursday_las_vegas": "Bachelor party base for all 8 guests",
+        "friday_saturday_lake_tahoe": "All 8 guests, 2 consecutive nights"
+      },
+      "maximum_guest_party_size": 8,
+      "all_events_required": true,
+      "group_must_reunite_friday_noon": "All 8 guests arrive at Lake Tahoe by Friday noon for rehearsal"
+    },
+    "soft": {
+      "interests": ["nightlife", "upscale_lodging", "celebration", "scenic_routes"],
+      "preferences": ["mountain_setting", "lakeside_hotels", "scenic_drives"]
+    }
+  },
+  "dynamic_events": [
+    {
+      "event_id": "event_1",
+      "trigger_turn": 3,
+      "event_type": "flight_cancellation_weather",
+      "description": "On Thursday morning (travel day), severe coastal fog causes the 10 AM flight from SFO to Las Vegas for the 8 guests to be cancelled. To salvage the bachelor party, you MUST rebook all 8 guests on a Thursday evening flight to LAS. This last-minute flight is much more expensive and will put extreme pressure on your $12000 total budget.",
+      "affected_components": [
+        "outbound_flight",
+        "total_trip_budget"
+      ],
+      "resolution_requirements": [
+        "Explicitly CANCEL the originally booked SFO-LAS morning flight.",
+        "Immediately search and book a replacement Thursday EVENING flight from SFO to LAS.",
+        "Acknowledge the budget hit and actively optimize remaining Lake Tahoe hotel/activity choices to stay under $12000."
+      ]
+    },
+    {
+      "event_id": "event_2",
+      "trigger_turn": 8,
+      "event_type": "hotel_overbooking_cascading",
+      "description": "Friday morning: The Lake Tahoe lodge calls to inform you that due to a massive plumbing failure, their entire property is closed for the weekend. You must immediately find alternative accommodations for all 8 guests in a NEW single property in the Lake Tahoe area.",
+      "affected_components": [
+        "hotel_friday_saturday_lake_tahoe",
+        "total_trip_budget"
+      ],
+      "resolution_requirements": [
+        "Explicitly CANCEL the original Lake Tahoe lodge booking.",
+        "Immediately secure emergency hotel rooms for all 8 guests at a NEW single property in the Lake Tahoe area.",
+        "Verify the new property can accommodate the group for Friday, Saturday, and Sunday nights.",
+        "Recalculate total accommodation budget impact and verify you can still afford the wedding events within the $12000 budget."
+      ]
+    }
+  ],
+  "required_components": [
+    "outbound_flight",
+    "hotel_thursday_las_vegas",
+    "bachelor_party_thursday_las_vegas",
+    "mid_trip_flight",
+    "hotel_friday_saturday_lake_tahoe",
+    "rehearsal_friday_lake_tahoe",
+    "rehearsal_dinner_friday_lake_tahoe",
+    "wedding_saturday_lake_tahoe",
+    "post_wedding_brunch_sunday",
+    "return_flight"
+  ],
+  "success_criteria": {
+    "total_cost_max": 12000,
+    "all_flights_booked": true,
+    "all_hotels_reserved_lake_tahoe_fri_sat_sun": true,
+    "all_8_guests_arrive_tahoe_by_friday_noon": true,
+    "return_flights_booked_sunday": true,
+    "all_disruptions_mitigated": true,
+    "travel_logistics_feasible": true
+  },
+  "expected_challenges": [
+    "Cost recovery under pressure: The agent is forced to book an expensive last-minute flight to Las Vegas, significantly reducing the budget available for the remaining 3 days.",
+    "Emergency Hotel Relocation: Must rapidly rebook the entire group of 8 into a new single hotel property in Lake Tahoe due to a venue closure.",
+    "Budget balancing: With two major disruptions causing premium pricing, the agent must make smart tradeoffs (e.g., choosing cheaper restaurants or activities) to satisfy all required wedding components under the strict $12000 limit.",
+    "Temporal coordination: All disruptions must be resolved sequentially while ensuring the strict multi-city timeline is maintained."
+  ],
+  "notes": "HARD task because: (1) Requires the agent to perform 'Plan Repair' twice (canceling and rebooking flights, then hotels), (2) Enforces strict budget survival logic where the agent must adapt its spending behavior for downstream requirements after early budget shocks, (3) Contains a dense list of required events across three cities that must be logically scheduled."
+}
