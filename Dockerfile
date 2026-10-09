@@ -1,5 +1,7 @@
 # Backend image (FastAPI + agent + MCP server) for Railway or any container host.
-FROM python:3.12-slim
+# Official Docker python image, pulled via AWS's public mirror: Docker Hub rate-limits anonymous pulls
+# from shared CI builders (Railway builds failed with "429 Too Many Requests").
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
