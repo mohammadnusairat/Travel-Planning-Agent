@@ -13,7 +13,7 @@ export default function App() {
     <div className="shell">
       <header className="topbar">
         <NavLink to="/" className="brand">
-          <span aria-hidden>✈</span> TravelBench Planner
+          <img src="/favicon.svg" alt="" width={24} height={24} className="brand-mark" /> TravelBench Planner
         </NavLink>
         <nav>
           <NavLink to="/plan">Plan a trip</NavLink>
