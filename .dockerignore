@@ -1,0 +1,13 @@
+.env
+.env.*
+.git
+.venv
+venv
+data
+results
+web
+tests
+agent_planning_results
+baseline_results
+**/__pycache__
+**/.pytest_cache

@@ -9,8 +9,13 @@ Usage:
 import json
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.agent import TravelAgent
 
@@ -80,8 +85,10 @@ def print_results(result: Dict[str, Any], verbose: bool = False):
     if 'metadata' in result:
         meta = result['metadata']
         print(f"\nMetadata:")
-        print(f"  • Total tokens: {meta.get('total_tokens', 'N/A')}")
+        print(f"  • Total tokens: {meta.get('total_tokens', 'N/A')} "
+              f"(in {meta.get('input_tokens', 'N/A')} / out {meta.get('output_tokens', 'N/A')})")
         print(f"  • API calls: {meta.get('api_calls', 'N/A')}")
+        print(f"  • Estimated cost: ${meta.get('estimated_cost_usd') or 0:.4f}")
         print(f"  • Tool calls: {meta.get('tool_calls', 'N/A')}")
         print(f"  • Time elapsed: {meta.get('time_elapsed', 'N/A')}s")
     
@@ -122,7 +129,7 @@ def run_task(task_path: str, verbose: bool = False):
     print("\nInitializing agent...")
     try:
         agent = TravelAgent(api_key=api_key)
-        print("Agent ready")
+        print(f"Agent ready ({len(agent.mcp_client.tool_names)} MCP tools)")
     except Exception as e:
         print(f"Error initializing agent: {e}")
         return
@@ -130,7 +137,8 @@ def run_task(task_path: str, verbose: bool = False):
     # Run planning
     print("\nStarting planning...\n")
     try:
-        result = agent.plan_trip(task)
+        with agent:
+            result = agent.plan_trip(task)
         print_results(result, verbose=verbose)
         
         # Save results

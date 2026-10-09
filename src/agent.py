@@ -1,5 +1,8 @@
 """
 src/agent.py - Travel Planning Agent with ReAct Loop
+
+LLM calls go through LangChain (ChatAnthropic); tools are discovered from the
+travel MCP server and invoked as LangChain tools over MCP.
 """
 
 import ast
@@ -7,44 +10,137 @@ import json
 import re
 import time
 from datetime import datetime, date, time as dt_time, timedelta
-from typing import Dict, Any, List, Optional, Tuple
-from anthropic import Anthropic
+from typing import Callable, Dict, Any, List, Optional, Tuple
 
-from src.tools.flights import FlightSearchTool
-from src.tools.hotels import HotelSearchTool
-from src.tools.restaurants import RestaurantSearchTool
-from src.tools.activities import ActivitySearchTool
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+
 from src.core.constraints import ConstraintTracker
+from src.core.llm_errors import LLMUnavailableError, classify_llm_error
+from src.core.mcp_client import MCPServiceProxy, MCPToolClient
+from src.core.usage import UsageTracker, usage_from_message
 from src.utils.types import Booking
 from src.utils.prompts import (
-    SYSTEM_PROMPT,
     ERROR_HANDLING_PROMPT,
+    build_system_prompt,
     create_planning_prompt,
     create_replanning_prompt,
     create_final_itinerary_prompt,
 )
 
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
+# Tool turns stop once the model starts imagining the observation or a second step.
+ACTION_STOP_SEQUENCES = ["\nOBSERVATION", "\nTHOUGHT:"]
+
+# MCP tools that only read data (no booking state change).
+INFO_TOOLS = {
+    "find_connecting_flights",
+    "get_flight_details",
+    "get_hotel_details",
+    "get_restaurant_details",
+    "get_activity_details",
+    "check_availability",
+    "get_destination_overview",
+}
+
 
 class TravelAgent:
 
-    def __init__(self, api_key: str):
-        self.client = Anthropic(api_key=api_key)
-        self.model = "claude-sonnet-4-6"
-        self._initialize_tools()
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        llm: Optional[BaseChatModel] = None,
+        model: str = DEFAULT_MODEL,
+        mcp_transport: str = "stdio",
+        mcp_client: Optional[MCPToolClient] = None,
+        event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ):
+        self.model = model
+        # Receives (event_type, payload) for every step, tool result, disruption, and state change.
+        self.event_callback = event_callback
+        self._stop_requested = False
+        if llm is None:
+            from langchain_anthropic import ChatAnthropic
+            llm = ChatAnthropic(model=model, api_key=api_key, max_tokens=4096, timeout=180, max_retries=2)
+        self.llm = llm
+        self._initialize_tools(mcp_client or MCPToolClient(transport=mcp_transport))
         # these are reset per-run in _reset()
         self.tracker = None
         self.conversation_history = []
         self.turn_count = 0
         self.metadata = {}
 
-    def _initialize_tools(self):
-        self.flight_tool = FlightSearchTool("benchmarks/mock_data/flights.json")
-        self.hotel_tool = HotelSearchTool("benchmarks/mock_data/hotels.json")
-        self.restaurant_tool = RestaurantSearchTool("benchmarks/mock_data/restaurants.json")
-        self.activity_tool = ActivitySearchTool("benchmarks/mock_data/activities.json")
+    def _initialize_tools(self, mcp_client: MCPToolClient):
+        self.mcp_client = mcp_client
+        self.flight_tool = MCPServiceProxy(mcp_client, search="search_flights", book="book_flight", cancel="cancel_flight")
+        self.hotel_tool = MCPServiceProxy(mcp_client, search="search_hotels", book="book_hotel", cancel="cancel_hotel")
+        self.restaurant_tool = MCPServiceProxy(mcp_client, search="search_restaurants", book="book_restaurant", cancel="cancel_restaurant")
+        self.activity_tool = MCPServiceProxy(mcp_client, search="search_activities", book="book_activity", cancel="cancel_activity")
+        self.system_prompt = build_system_prompt(mcp_client.describe_tools())
+
+    def close(self):
+        """Shut down the MCP session (and its server subprocess)."""
+        client = getattr(self, "mcp_client", None)
+        if client is not None:
+            client.close()
+
+    def __enter__(self) -> "TravelAgent":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def request_stop(self):
+        """Ask a running plan_trip to finish after the current step (renders what is booked so far)."""
+        self._stop_requested = True
+
+    def _emit(self, event_type: str, **payload: Any) -> None:
+        callback = getattr(self, "event_callback", None)
+        if callback is None:
+            return
+        try:
+            callback(event_type, payload)
+        except Exception as exc:  # observers must never break planning
+            print(f"  [event callback error] {exc}", flush=True)
+
+    def state_snapshot(self) -> Dict[str, Any]:
+        """Live view of bookings, budget, requirements, violations, and usage."""
+        requirements = [
+            {"component": c, "matched": self._matched_component_count(c), "required": self._required_component_target(c)}
+            for c in self._required_components
+        ]
+        if self._implicit_flight_requirement_enabled():
+            requirements.append({"component": "intercity_outbound_flight", "matched": int(self._has_matching_transport_flight("outbound")), "required": 1})
+            if self._return_transport_required():
+                requirements.append({"component": "intercity_return_flight", "matched": int(self._has_matching_transport_flight("return")), "required": 1})
+        usage = self.usage.summary()
+        return {
+            "bookings": [
+                {
+                    "booking_id": b.booking_id,
+                    "type": b.type,
+                    "name": (b.details or {}).get("name") or (b.details or {}).get("hotel_name")
+                    or " -> ".join(filter(None, [(b.details or {}).get("origin_city"), (b.details or {}).get("destination_city")]))
+                    or b.booking_id,
+                    "date": (b.details or {}).get("date") or (b.details or {}).get("departure_date") or (b.details or {}).get("check_in"),
+                    "time": (b.details or {}).get("time") or (b.details or {}).get("departure_time"),
+                    "end_date": (b.details or {}).get("check_out"),
+                    "cost": b.cost,
+                }
+                for b in self.tracker.bookings
+            ],
+            "budget_used": self.tracker.budget_used,
+            "budget_max": self.tracker.budget_max,
+            "party_size": self._current_party_size,
+            "requirements": requirements,
+            "violations": [v.model_dump() for v in self.tracker.validate_itinerary()],
+            "usage": {k: usage[k] for k in ("api_calls", "input_tokens", "output_tokens", "total_tokens", "estimated_cost_usd", "tool_calls", "tool_errors")},
+        }
 
     def _reset(self):
         """Reset all per-run state so the agent can be called multiple times."""
+        self._stop_requested = False
         self.tracker = ConstraintTracker()
         self.conversation_history = []
         self.turn_count = 0
@@ -59,8 +155,12 @@ class TravelAgent:
         self._triggered_events = []
         self._post_requirements_turns = 0
         self._use_full_model = True
+        self.usage = UsageTracker(self.model)
         self.metadata = {
+            "model": self.model,
             "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
             "api_calls": 0,
             "tool_calls": 0,
             "start_time": None,
@@ -74,31 +174,47 @@ class TravelAgent:
         self.metadata["start_time"] = time.time()
 
         self._load_constraints(task)
+        self._emit("started", title=task.get("title", ""), state=self.state_snapshot())
         initial_prompt = self._create_planning_prompt(task)
-        itinerary = self._react_planning_loop(initial_prompt, task)
+        llm_error = None
+        try:
+            itinerary = self._react_planning_loop(initial_prompt, task)
+        except LLMUnavailableError as exc:
+            # Keep what was booked before the API refused service.
+            llm_error = {"kind": exc.kind, "message": exc.user_message, "detail": exc.detail}
+            self._emit("llm_unavailable", **llm_error)
+            itinerary = self._render_final_itinerary()
 
         self.metadata["end_time"] = time.time()
         self.metadata["time_elapsed"] = round(
             self.metadata["end_time"] - self.metadata["start_time"], 2
         )
+        self.metadata.update(self.usage.summary())
+        self.metadata["mcp_transport"] = getattr(self.mcp_client, "transport", None)
 
         final_itinerary_present = bool(itinerary and "FINAL ITINERARY" in itinerary)
         required_components_satisfied = self._all_required_components_satisfied()
         planning_requirements_satisfied = self._all_planning_requirements_satisfied()
         hard_constraints_satisfied = self._hard_constraints_satisfied()
         success_criteria_satisfied = self._success_criteria_satisfied()
+        violations = self.tracker.validate_itinerary()
+        errors = [v.message for v in violations if v.severity == "error"]
 
         return {
             "itinerary": itinerary,
             "conversation": self.conversation_history,
             "metadata": self.metadata,
             "operation_log": list(self._operation_log),
+            "validation": (not errors, errors),
+            "constraint_violations": [v.model_dump() for v in violations],
             "final_itinerary_present": final_itinerary_present,
             "required_components_satisfied": required_components_satisfied,
             "planning_requirements_satisfied": planning_requirements_satisfied,
             "hard_constraints_satisfied": hard_constraints_satisfied,
             "success_criteria_satisfied": success_criteria_satisfied,
+            "llm_error": llm_error,
             "success": (
+                llm_error is None and
                 final_itinerary_present and
                 planning_requirements_satisfied and
                 hard_constraints_satisfied and
@@ -134,6 +250,9 @@ class TravelAgent:
 
         iteration = 0
         while iteration < max_iterations:
+            if self._stop_requested:
+                self._emit("stopped", iteration=iteration)
+                return self._render_final_itinerary()
             iteration += 1
             self.turn_count += 1
             print(f"  [iter {iteration}/{max_iterations}] thinking...", flush=True)
@@ -142,6 +261,16 @@ class TravelAgent:
             self._use_full_model = False
 
             action_needed, tool_name, tool_params = self._parse_action(response)
+            last_call = self.usage.llm_calls[-1] if self.usage.llm_calls else {}
+            self._emit(
+                "step",
+                iteration=iteration,
+                text=response,
+                action=tool_name if action_needed else None,
+                params=tool_params if action_needed else None,
+                input_tokens=last_call.get("input_tokens", 0),
+                output_tokens=last_call.get("output_tokens", 0),
+            )
             if action_needed:
                 print(f"  [iter {iteration}] ACTION: {tool_name}", flush=True)
             else:
@@ -153,6 +282,15 @@ class TravelAgent:
                 tool_result = self._execute_tool(tool_name, tool_params)
 
                 error_message = self._extract_tool_error(tool_result)
+                self._emit(
+                    "tool_result",
+                    iteration=iteration,
+                    tool=tool_name,
+                    ok=not error_message,
+                    error=error_message or None,
+                    preview=self._result_preview(tool_result),
+                    state=self.state_snapshot(),
+                )
                 if error_message:
                     observation = ERROR_HANDLING_PROMPT.format(error_message=error_message)
                 else:
@@ -167,6 +305,7 @@ class TravelAgent:
                     pending_events.remove(event)
                     print(f"  [iter {iteration}] DYNAMIC EVENT: {event.get('event_type')}", flush=True)
                     replanning_prompt = self._handle_dynamic_event(event, response, task)
+                    self._emit_disruption(iteration)
                     self.conversation_history.append({"role": "user", "content": replanning_prompt})
                     self._use_full_model = True
                     break  # one event at a time
@@ -178,6 +317,7 @@ class TravelAgent:
                     pending_events.remove(event)
                     print(f"  [iter {iteration}] DYNAMIC EVENT: {event.get('event_type')}", flush=True)
                     replanning_prompt = self._handle_dynamic_event(event, response, task)
+                    self._emit_disruption(iteration)
                     self.conversation_history.append({"role": "user", "content": replanning_prompt})
                     self._use_full_model = True
                     user_message_added = True
@@ -217,6 +357,41 @@ class TravelAgent:
                 self.conversation_history.append({"role": "user", "content": "Continue planning."})
 
         return self._render_final_itinerary()
+
+    def _emit_disruption(self, iteration: int) -> None:
+        event_state = self._triggered_events[-1]
+        self._emit(
+            "disruption",
+            iteration=iteration,
+            event_type=event_state["event_type"],
+            description=event_state["description"],
+            affected_booking_ids=event_state["affected_booking_ids"],
+            dependent_booking_ids=event_state["dependent_booking_ids"],
+            removed_booking_ids=event_state["removed_booking_ids"],
+            budget_max_after=event_state["budget_max_after"],
+            party_size_after=event_state["party_size_after"],
+            state=self.state_snapshot(),
+        )
+
+    @staticmethod
+    def _result_preview(result: Any) -> Dict[str, Any]:
+        """Compact summary of a tool result for live display."""
+        def label(item: Any) -> str:
+            if not isinstance(item, dict):
+                return str(item)[:80]
+            name = item.get("name") or item.get("flight_id") or item.get("hotel_id") or item.get("activity_id") or item.get("restaurant_id")
+            price = next((item[k] for k in ("price_per_seat", "price_per_night", "price_per_person", "average_cost_per_person", "total_price_per_seat") if k in item), None)
+            return f"{name} (${price})" if price is not None else str(name)
+
+        if isinstance(result, list):
+            return {"count": len(result), "items": [label(i) for i in result[:5]]}
+        if isinstance(result, dict):
+            lists = {k: v for k, v in result.items() if isinstance(v, list)}
+            if lists and "status" not in result:
+                return {k: {"count": len(v), "items": [label(i) for i in v[:5]]} for k, v in lists.items()}
+            keep = ("status", "booking_id", "cost", "message", "error", "available", "reasons")
+            return {k: result[k] for k in keep if k in result} or {"fields": list(result)[:8]}
+        return {"value": str(result)[:200]}
 
     def _handle_dynamic_event(self, event: Dict[str, Any], itinerary: str, task: Dict[str, Any]) -> str:
         """Build and return a replanning prompt for a dynamic event."""
@@ -377,6 +552,14 @@ class TravelAgent:
                 "\n".join(f"  [ ] {item}" for item in unmet_success_criteria)
             )
 
+        # --- Constraint violations (budget / temporal / dependency / accessibility) ---
+        violations = self.tracker.validate_itinerary()
+        if violations:
+            parts.append(
+                "CONSTRAINT VIOLATIONS (errors must be fixed before finalizing):\n" +
+                "\n".join(f"- [{v.severity}] {v.rule}: {v.message}" for v in violations)
+            )
+
         # --- Already-searched queries ---
         if self._searched:
             parts.append("ALREADY SEARCHED (do not search again):\n- " +
@@ -520,8 +703,20 @@ class TravelAgent:
         lines.extend(self._render_final_success_criteria_section())
         lines.append("")
         lines.extend(self._render_final_audit_section())
+        lines.append("")
+        lines.extend(self._render_final_validation_section())
 
         return "\n".join(lines).rstrip() + "\n"
+
+    def _render_final_validation_section(self) -> List[str]:
+        lines = ["## 9. Constraint Validation", ""]
+        violations = self.tracker.validate_itinerary()
+        if not violations:
+            lines.append("All budget, temporal, dependency, and accessibility rules pass.")
+            return lines
+        rows = [[v.severity.upper(), v.rule, v.message] for v in violations]
+        lines.extend(self._markdown_table(["Severity", "Rule", "Detail"], rows))
+        return lines
 
     def _render_final_flights_section(self) -> List[str]:
         flights = sorted(self.tracker.get_bookings_by_type("flight"), key=self._booking_sort_key)
@@ -1060,7 +1255,8 @@ class TravelAgent:
         generic_words = {
             "hotel", "hotels", "lodge", "lodges", "accommodation", "accommodations",
             "resort", "resorts", "inn", "motel", "cabin", "night", "nights", "min", "max",
-            "room", "rooms", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
+            "room", "rooms", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+            "wheelchair", "accessible",  # accessibility is checked above, not a location hint
         }
         
         location_hints = {t for t in req_tokens if t not in generic_words and not t.isdigit()}
@@ -1198,18 +1394,8 @@ class TravelAgent:
         return tag in full_data.get("tags", [])
 
     def _hard_constraints_satisfied(self) -> bool:
-        if self.tracker.budget_max is not None and self.tracker.budget_used > self.tracker.budget_max:
-            return False
-
-        hard_constraints = {constraint.name: constraint.value for constraint in self.tracker.get_hard_constraints()}
-        accessibility_required = bool(
-            hard_constraints.get("wheelchair_accessible") or hard_constraints.get("accessibility_required")
-        )
-        if accessibility_required:
-            for booking in self.tracker.bookings:
-                if booking.type in {"hotel", "restaurant", "activity"} and not self._detail_or_tag_match(booking.details or {}, "wheelchair_accessible"):
-                    return False
-        return True
+        # Budget, temporal, lodging-dependency, and accessibility rules live in the ConstraintTracker.
+        return self.tracker.is_valid()
 
     def _success_criteria_satisfied(self) -> bool:
         if not self._success_criteria:
@@ -1333,71 +1519,66 @@ class TravelAgent:
             return False
         return self.tracker.get_remaining_budget() > 0
 
-    def _build_messages(self) -> List[Dict]:
-        """Build windowed message list with injected booking summary."""
+    def _build_messages(self) -> List[BaseMessage]:
+        """Build windowed LangChain message list with injected booking summary."""
         window = 8
         if len(self.conversation_history) > window + 1:
-            messages = [self.conversation_history[0]] + self.conversation_history[-window:]
+            history = [self.conversation_history[0]] + self.conversation_history[-window:]
         else:
-            messages = list(self.conversation_history)
+            history = list(self.conversation_history)
         booking_note = {"role": "user", "content": self._booking_summary()}
-        return [messages[0], booking_note] + messages[1:]
+        messages: List[BaseMessage] = [SystemMessage(content=self.system_prompt)]
+        for message in [history[0], booking_note] + history[1:]:
+            message_cls = AIMessage if message["role"] == "assistant" else HumanMessage
+            messages.append(message_cls(content=message["content"]))
+        return messages
 
     def _get_agent_response(self) -> str:
         """
-        Always uses Sonnet. Planning/replanning/final turns get a full blocking response
-        (4096 tokens). Tool-calling turns use streaming with early stop once a complete
-        ACTION(...) line is received (700 tokens), avoiding waiting for the full output.
+        Planning/replanning/final turns get a full response. Tool-calling turns stop at
+        ACTION_STOP_SEQUENCES so the model emits exactly one THOUGHT/ACTION step and the
+        response still carries complete usage metadata for token accounting.
         """
         full = self._use_full_model
-        max_tokens = 4096
         messages = self._build_messages()
-
+        started = time.time()
         try:
             if full:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    messages=messages,
-                    system=SYSTEM_PROMPT,
-                    timeout=180,
-                )
-                self.metadata["api_calls"] += 1
-                self.metadata["total_tokens"] += response.usage.input_tokens + response.usage.output_tokens
-                response_text = response.content[0].text
+                response = self.llm.invoke(messages)
             else:
-                response_text = self._stream_until_action(self.model, max_tokens, messages)
-                self.metadata["api_calls"] += 1
-
-            self.conversation_history.append({"role": "assistant", "content": response_text})
-            return response_text
+                response = self.llm.invoke(messages, stop=ACTION_STOP_SEQUENCES)
         except Exception as e:
+            kind = classify_llm_error(e)
+            if kind:
+                # Out of credits / bad key: every further call would fail the same way.
+                raise LLMUnavailableError(kind, str(e)) from e
             return f"Error: {e}"
 
-    def _stream_until_action(self, model: str, max_tokens: int, messages: List[Dict]) -> str:
-        """Stream the response and stop as soon as a complete ACTION(...) line is received."""
-        chunks: List[str] = []
-        try:
-            with self.client.messages.stream(
-                model=model,
-                max_tokens=max_tokens,
-                messages=messages,
-                system=SYSTEM_PROMPT,
-                timeout=60,
-            ) as stream:
-                for text in stream.text_stream:
-                    chunks.append(text)
-                    current = "".join(chunks)
-                    # Stop early once we have a complete ACTION(...)  line
-                    if "ACTION:" in current:
-                        for line in current.split("\n"):
-                            if "ACTION:" in line and "(" in line and line.count(")") >= line.count("("):
-                                return current   # complete action found — stop streaming
-        except Exception as e:
-            if chunks:
-                return "".join(chunks)  # return whatever we got before the error
-            raise
-        return "".join(chunks)
+        self._record_llm_usage(response, time.time() - started, "plan_or_replan" if full else "react_step")
+        response_text = self._message_text(response)
+        self.conversation_history.append({"role": "assistant", "content": response_text})
+        return response_text
+
+    def _record_llm_usage(self, response: Any, latency_s: float, purpose: str) -> None:
+        usage = usage_from_message(response)
+        self.usage.record_llm_call(usage["input_tokens"], usage["output_tokens"], latency_s, purpose, self.turn_count)
+        self.metadata["api_calls"] = len(self.usage.llm_calls)
+        self.metadata["input_tokens"] = self.usage.input_tokens
+        self.metadata["output_tokens"] = self.usage.output_tokens
+        self.metadata["total_tokens"] = self.usage.input_tokens + self.usage.output_tokens
+
+    @staticmethod
+    def _message_text(message: Any) -> str:
+        content = getattr(message, "content", message)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+                if not isinstance(block, dict) or block.get("type") == "text"
+            )
+        return str(content)
 
     # ------------------------------------------------------------------
 
@@ -1450,9 +1631,16 @@ class TravelAgent:
             dependent_types.update({"hotel", "restaurant", "activity"})
 
         affected_ids = {booking.booking_id for booking in affected_bookings}
+        dependent_ids = {
+            booking.booking_id for booking in self.tracker.bookings
+            if booking.type in dependent_types
+        }
+        # Dependency rules: anything transitively relying on an affected booking.
+        for booking in affected_bookings:
+            dependent_ids.update(self.tracker.find_all_affected_bookings(booking.booking_id))
         return [
             booking for booking in self.tracker.bookings
-            if booking.type in dependent_types and booking.booking_id not in affected_ids
+            if booking.booking_id in dependent_ids and booking.booking_id not in affected_ids
         ]
 
     def _format_booking_refs(self, bookings: List[Booking]) -> str:
@@ -1968,71 +2156,20 @@ class TravelAgent:
         return bool({"animal", "zoo", "safari", "wildlife", "wildlife_park"} & tokens)
 
     def _booking_time_window(self, booking: Booking) -> Optional[Tuple[datetime, datetime]]:
-        details = booking.details or {}
-        if booking.type == "activity":
-            full_data = details.get("full_data", {}) if isinstance(details.get("full_data"), dict) else {}
-            activity_type = str(full_data.get("type", details.get("type", ""))).lower()
-            if "transportation" in activity_type or "rental" in activity_type:
-                return None
-            booking_date = self._parse_date(str(details.get("date", "")))
-            booking_time = self._parse_time(str(details.get("time", "")))
-            duration_hours = ((details.get("full_data") or {}).get("duration_hours") if isinstance(details.get("full_data"), dict) else None) or 2
-            if booking_date is None or booking_time is None:
-                return None
-            start = datetime.combine(booking_date, booking_time)
-            end = start + timedelta(hours=float(duration_hours))
-            return start, end
-
-        if booking.type == "restaurant":
-            booking_date = self._parse_date(str(details.get("date", "")))
-            booking_time = self._parse_time(str(details.get("time", "")))
-            if booking_date is None or booking_time is None:
-                return None
-            start = datetime.combine(booking_date, booking_time)
-            end = start + timedelta(minutes=90)
-            return start, end
-
-        if booking.type == "flight":
-            departure_date = self._parse_date(str(details.get("departure_date", "")))
-            departure_time = self._parse_time(str(details.get("departure_time", "")))
-            arrival_time = self._parse_time(str(details.get("arrival_time", "")))
-            if departure_date is None or departure_time is None or arrival_time is None:
-                return None
-            start = datetime.combine(departure_date, departure_time)
-            end = datetime.combine(departure_date, arrival_time)
-            if end < start:
-                end += timedelta(days=1)
-            return start, end
-
-        return None
+        return self.tracker.booking_time_window(booking)
 
     def _windows_overlap(
         self,
         left: Tuple[datetime, datetime],
         right: Tuple[datetime, datetime],
     ) -> bool:
-        return left[0] < right[1] and right[0] < left[1]
+        return ConstraintTracker.windows_overlap(left, right)
 
     def _booking_violates_flight_buffers(self, booking: Booking) -> bool:
-        booking_window = self._booking_time_window(booking)
-        if booking_window is None:
+        window = self.tracker.booking_time_window(booking)
+        if window is None:
             return False
-
-        for flight in self.tracker.get_bookings_by_type("flight"):
-            flight_window = self._booking_time_window(flight)
-            if flight_window is None:
-                continue
-            flight_details = flight.details or {}
-            flight_type = str(flight_details.get("type", "")).lower()
-            if flight_type == "outbound_flight":
-                if booking_window[0].date() == flight_window[0].date():
-                    if booking_window[0] < flight_window[1] + timedelta(minutes=90):
-                        return True
-            elif flight_type == "return_flight":
-                if booking_window[0].date() == flight_window[0].date():
-                    if booking_window[1] > flight_window[0] - timedelta(minutes=120):
-                        return True
-        return False
+        return self.tracker.find_flight_buffer_conflict(window, self.tracker.booking_city(booking)) is not None
 
     def _parse_action(self, response: str) -> Tuple[bool, str, Dict]:
         if "ACTION:" not in response:
@@ -2127,35 +2264,37 @@ class TravelAgent:
         method: str,
         processed_params: Dict[str, Any],
     ) -> str:
-        if method != "book" or tool_name not in {"book_restaurant", "book_activity"}:
+        """Screen a booking against the ConstraintTracker's temporal rules before it is made."""
+        if method != "book" or tool_name not in {"book_restaurant", "book_activity", "book_hotel"}:
             return ""
 
         duplicate_error = self._validate_duplicate_candidate(tool_name, processed_params)
         if duplicate_error:
             return duplicate_error
 
-        candidate_window = self._candidate_booking_time_window(tool_name, processed_params)
-        if candidate_window is None:
+        booking_type = tool_name.split("_", 1)[1]
+        details = self._candidate_details(tool_name, processed_params)
+        if details is None:
             return ""
+        candidate_window = self.tracker.time_window(booking_type, details)
 
-        for booking in self.tracker.bookings:
-            booking_window = self._booking_time_window(booking)
-            if booking_window is None:
-                continue
-            if self._windows_overlap(candidate_window, booking_window):
+        for violation in self.tracker.check_candidate(booking_type, details):
+            if violation.rule == "time_overlap" and candidate_window is not None:
+                other = self.tracker.get_booking(violation.booking_ids[0])
+                other_window = self.tracker.booking_time_window(other)
                 return (
                     "Timing conflict: this booking "
                     f"({self._format_time_window(candidate_window)}) overlaps with existing "
-                    f"{booking.type} {booking.booking_id} ({self._format_time_window(booking_window)}). "
-                    f"Choose a start time at or after {booking_window[1].strftime('%H:%M')}."
+                    f"{other.type} {other.booking_id} ({self._format_time_window(other_window)}). "
+                    f"Choose a start time at or after {other_window[1].strftime('%H:%M')}."
                 )
-
-        if self._candidate_violates_flight_buffers(candidate_window):
-            return (
-                "Timing conflict: this booking violates the required airport or arrival buffer around an existing flight. "
-                f"Candidate window: {self._format_time_window(candidate_window)}."
-            )
-
+            if violation.rule == "flight_buffer" and candidate_window is not None:
+                return (
+                    "Timing conflict: this booking violates the required airport or arrival buffer around an existing flight. "
+                    f"Candidate window: {self._format_time_window(candidate_window)}."
+                )
+            if violation.rule == "outside_trip_dates":
+                return f"Date conflict: {violation.message} Book within the trip dates."
         return ""
 
     def _validate_duplicate_candidate(
@@ -2183,76 +2322,82 @@ class TravelAgent:
                 )
         return ""
 
+    def _candidate_details(
+        self,
+        tool_name: str,
+        processed_params: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Booking details shaped like a committed booking, for pre-booking constraint checks."""
+        if tool_name == "book_activity":
+            activity = self._lookup_activity(processed_params.get("activity_id"))
+            if activity is None:
+                return None
+            return {
+                "date": processed_params.get("date"),
+                "time": processed_params.get("time"),
+                "full_data": activity,
+            }
+        if tool_name == "book_restaurant":
+            restaurant = self._lookup_item("get_restaurant_details", restaurant_id=processed_params.get("restaurant_id"))
+            return {
+                "date": processed_params.get("date"),
+                "time": processed_params.get("time"),
+                "full_data": restaurant or {},
+            }
+        if tool_name == "book_hotel":
+            return {
+                "check_in": processed_params.get("check_in"),
+                "check_out": processed_params.get("check_out"),
+            }
+        return None
+
     def _candidate_booking_time_window(
         self,
         tool_name: str,
         processed_params: Dict[str, Any],
     ) -> Optional[Tuple[datetime, datetime]]:
-        if tool_name == "book_activity":
-            activity = self._lookup_activity(processed_params.get("activity_id"))
-            if activity:
-                activity_type = str(activity.get("type", "")).lower()
-                if "transportation" in activity_type or "rental" in activity_type:
-                    return None
-            booking_date = self._parse_date(str(processed_params.get("date", "")))
-            booking_time = self._parse_time(str(processed_params.get("time", "")))
-            if activity is None or booking_date is None or booking_time is None:
-                return None
-            start = datetime.combine(booking_date, booking_time)
-            end = start + timedelta(hours=float(activity.get("duration_hours", 2)))
-            return start, end
-
-        if tool_name == "book_restaurant":
-            booking_date = self._parse_date(str(processed_params.get("date", "")))
-            booking_time = self._parse_time(str(processed_params.get("time", "")))
-            if booking_date is None or booking_time is None:
-                return None
-            start = datetime.combine(booking_date, booking_time)
-            end = start + timedelta(minutes=90)
-            return start, end
-
-        return None
+        details = self._candidate_details(tool_name, processed_params)
+        if details is None:
+            return None
+        return self.tracker.time_window(tool_name.split("_", 1)[1], details)
 
     def _candidate_violates_flight_buffers(
         self,
         candidate_window: Tuple[datetime, datetime],
     ) -> bool:
-        for flight in self.tracker.get_bookings_by_type("flight"):
-            flight_window = self._booking_time_window(flight)
-            if flight_window is None:
-                continue
-            flight_details = flight.details or {}
-            flight_type = str(flight_details.get("type", "")).lower()
-            if candidate_window[0].date() != flight_window[0].date():
-                continue
-            if flight_type == "outbound_flight":
-                if candidate_window[0] < flight_window[1] + timedelta(minutes=90):
-                    return True
-            elif flight_type == "return_flight":
-                if candidate_window[1] > flight_window[0] - timedelta(minutes=120):
-                    return True
-        return False
+        return self.tracker.find_flight_buffer_conflict(candidate_window) is not None
 
     def _format_time_window(self, window: Tuple[datetime, datetime]) -> str:
-        start, end = window
-        if start.date() == end.date():
-            return f"{start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%H:%M')}"
-        return f"{start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}"
+        return ConstraintTracker.format_window(window)
 
     def _lookup_activity(self, activity_id: Any) -> Optional[Dict[str, Any]]:
-        if not activity_id or not hasattr(self.activity_tool, "activities"):
+        if not activity_id:
             return None
-        for activity in self.activity_tool.activities:
-            if activity.get("activity_id") == activity_id:
-                return activity
-        return None
+        if hasattr(self.activity_tool, "activities"):
+            for activity in self.activity_tool.activities:
+                if activity.get("activity_id") == activity_id:
+                    return activity
+            return None
+        return self._lookup_item("get_activity_details", activity_id=activity_id)
+
+    def _lookup_item(self, tool_name: str, **arguments: Any) -> Optional[Dict[str, Any]]:
+        """Fetch one inventory record over MCP; None when unavailable."""
+        client = getattr(self, "mcp_client", None)
+        if client is None or not all(arguments.values()):
+            return None
+        try:
+            record = client.call(tool_name, **arguments)
+        except Exception:
+            return None
+        if not isinstance(record, dict) or record.get("status") == "error":
+            return None
+        return record
 
     # ------------------------------------------------------------------
 
-    def _execute_tool(self, tool_name: str, params: Dict[str, Any]) -> Any:
-        self.metadata["tool_calls"] += 1
-
-        tool_action_map = {
+    def _tool_registry(self) -> Dict[str, Tuple[Any, str]]:
+        """Agent tool name -> (service, method). Methods: search | book | cancel | info | record."""
+        return {
             "search_flights":     (self.flight_tool,     "search"),
             "book_flight":        (self.flight_tool,     "book"),
             "cancel_flight":      (self.flight_tool,     "cancel"),
@@ -2265,28 +2410,35 @@ class TravelAgent:
             "search_activities":  (self.activity_tool,   "search"),
             "book_activity":      (self.activity_tool,   "book"),
             "cancel_activity":    (self.activity_tool,   "cancel"),
-            "record_surcharge":   (self,                 "record_surcharge"),
+            "record_surcharge":   (None,                 "record"),
+            **{name: (None, "info") for name in INFO_TOOLS},
         }
 
-        entry = tool_action_map.get(tool_name)
-        if entry is None:
-            return {"error": f"Unknown tool: {tool_name}"}
+    def _execute_tool(self, tool_name: str, params: Dict[str, Any]) -> Any:
+        self.metadata["tool_calls"] = self.metadata.get("tool_calls", 0) + 1
 
-        tool, method = entry
+        entry = self._tool_registry().get(tool_name)
+        if entry is None:
+            return self._record_tool_usage(tool_name, {"error": f"Unknown tool: {tool_name}"})
+
+        service, method = entry
         try:
             processed_params = self._process_tool_params(params)
             processed_params = self._apply_live_trip_state_to_params(tool_name, method, processed_params)
             order_error = self._validate_booking_order(tool_name, method)
             if order_error:
-                return {"status": "error", "message": order_error}
+                return self._record_tool_usage(tool_name, {"status": "error", "message": order_error})
             timing_error = self._validate_candidate_timing(tool_name, method, processed_params)
             if timing_error:
-                return {"status": "error", "message": timing_error}
-            result = getattr(tool, method)(**processed_params)
+                return self._record_tool_usage(tool_name, {"status": "error", "message": timing_error})
+            if service is None:
+                result = self.mcp_client.call(tool_name, **processed_params)
+            else:
+                result = getattr(service, method)(**processed_params)
             if tool_name == "search_restaurants" and method == "search":
                 result = self._expand_restaurant_search_results(processed_params, result)
         except Exception as e:
-            return {"error": str(e)}
+            return self._record_tool_usage(tool_name, {"error": str(e)})
 
         # Fix 1: record completed searches so the booking summary can warn the model
         if method == "search":
@@ -2296,13 +2448,27 @@ class TravelAgent:
             self._searched.add(key)
 
         if isinstance(result, dict) and result.get("status") == "success":
-            if method == "book":
-                booking_type = tool_name.split("_", 1)[1]  # "book_flight" → "flight"
+            if method in {"book", "record"}:
+                booking_type = tool_name.split("_", 1)[1]  # "book_flight" → "flight", "record_surcharge" → "surcharge"
+                cost = float(result.get("cost", 0.0))
+                # Budget limit: a discretionary booking may not push the trip over budget.
+                # Mandatory surcharges are always recorded so the budget reflects them.
+                if method == "book" and not self.tracker.is_within_budget(cost):
+                    service.cancel(booking_id=result["booking_id"])
+                    remaining = self.tracker.get_remaining_budget()
+                    return self._record_tool_usage(tool_name, {
+                        "status": "error",
+                        "message": (
+                            f"Budget limit: this {booking_type} costs ${cost:.2f} but only ${remaining:.2f} of the "
+                            f"${self.tracker.budget_max:.2f} budget remains. The reservation was released. "
+                            "Choose a cheaper option or cancel an existing booking first."
+                        ),
+                    })
                 if booking_type == "flight":
                     home_city = str(self._scenario.get("origin_city", "")).strip().lower()
                     flight_origin = str(result.get("details", {}).get("origin_city", "")).strip().lower()
                     flight_dest = str(result.get("details", {}).get("destination_city", "")).strip().lower()
-                    
+
                     if flight_origin == home_city:
                         result["details"]["type"] = "outbound_flight"
                     elif flight_dest == home_city:
@@ -2313,7 +2479,7 @@ class TravelAgent:
                     booking_id=result["booking_id"],
                     type=booking_type,
                     details=result.get("details", {}),
-                    cost=float(result.get("cost", 0.0)),
+                    cost=cost,
                 ))
                 self._record_operation(tool_name, method, result, processed_params)
             elif method == "cancel":
@@ -2322,7 +2488,13 @@ class TravelAgent:
                     self.tracker.remove_booking(booking_id)
                 self._record_operation(tool_name, method, result, processed_params)
 
-        return self._trim_result(result, method)
+        return self._record_tool_usage(tool_name, self._trim_result(result, method))
+
+    def _record_tool_usage(self, tool_name: str, result: Any) -> Any:
+        usage = getattr(self, "usage", None)
+        if usage is not None:
+            usage.record_tool_call(tool_name, ok=not self._extract_tool_error(result))
+        return result
 
     def _validate_booking_order(self, tool_name: str, method: str) -> str:
         if method not in {"search", "book"}:
@@ -2364,7 +2536,7 @@ class TravelAgent:
         booking_id = result.get("booking_id") or processed_params.get("booking_id")
         if summary_override:
             summary = summary_override
-        elif method == "book":
+        elif method in {"book", "record"}:
             summary = f"confirmed {result.get('booking_id', 'unknown booking')}"
         else:
             summary = f"cancelled {processed_params.get('booking_id', 'unknown booking')}"
@@ -2459,24 +2631,6 @@ class TravelAgent:
         return "\n".join(formatted) if formatted else "- None"
 
 
-    def record_surcharge(self, amount: float, description: str):
-        import time
-        fake_id = f"bk_surcharge_{int(time.time())}"
-        
-        self.tracker.add_booking(Booking(
-            booking_id=fake_id,
-            type="surcharge",
-            details={"name": description},
-            cost=float(amount)
-        ))
-        
-        return {
-            "status": "success", 
-            "booking_id": fake_id, 
-            "cost": float(amount),
-            "message": f"Surcharge of ${amount} recorded successfully."
-        }
-    
 if __name__ == "__main__":
     import os
 
@@ -2501,8 +2655,8 @@ if __name__ == "__main__":
         "dynamic_events": [],
     }
 
-    agent = TravelAgent(api_key=api_key)
-    result = agent.plan_trip(test_task)
+    with TravelAgent(api_key=api_key) as agent:
+        result = agent.plan_trip(test_task)
 
     print("=" * 70)
     print(f"Success: {result['success']}")

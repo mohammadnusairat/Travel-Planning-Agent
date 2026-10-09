@@ -2,8 +2,10 @@
 src/utils/prompts.py - Prompt Templates for the Agent
 """
 
+from typing import Any, Dict, List, Optional
+
  
-SYSTEM_PROMPT = """You are an expert travel planning agent that uses a ReAct (Reasoning + Acting) approach.
+SYSTEM_PROMPT_TEMPLATE = """You are an expert travel planning agent that uses a ReAct (Reasoning + Acting) approach.
  
 Your capabilities:
 - Search for flights, hotels, restaurants, and activities using tools
@@ -75,27 +77,38 @@ ACTION: cancel_flight(booking_id="bk_flight_CHI_NYC_003_20260715")
 ACTION: cancel_restaurant(booking_id="bk_rest_001_20260715")
 ACTION: cancel_activity(booking_id="bk_act_CHI_001_20260716")
 
-# 4. Utility Tools
+# 4. Lookup & Utility Tools (read-only checks before committing)
+ACTION: get_activity_details(activity_id="act_CHI_001")
+ACTION: check_availability(item_type="restaurant", item_id="rest_001", date="2026-07-15", time="19:00", party_size=2)
+ACTION: find_connecting_flights(original_city="Paris", destination_city="Venice", departure_date="2026-06-18")
+ACTION: get_destination_overview(city="Venice")
 ACTION: record_surcharge(amount=800, description="Flight rebooking penalty")
 
-Available tools (USE EXACT PARAMETER NAMES):
-- search_flights(original_city, destination_city, departure_date, return_date, departure_time_earliest, return_time_latest, max_price, wheelchair_accessible): Find outbound and return flights between cities.
-- book_flight(flight_id, outbound, origin_city, destination_city, departure_date, party_size): Book a specific flight.
-- cancel_flight(booking_id): Cancel a flight booking.
-- search_hotels(city, max_price, wheelchair_accessible): Find hotels in a city.
-- book_hotel(hotel_id, check_in, check_out, party_size, num_rooms): Book a specific hotel.
-- cancel_hotel(booking_id): Cancel a hotel booking.
-- search_restaurants(city, special_needs, interests, preferences, max_price, party_size, target_date, start_time, wheelchair_accessible): Find restaurants in a city.
-- book_restaurant(restaurant_id, date, time, party_size): Book a specific restaurant.
-- cancel_restaurant(booking_id): Cancel a restaurant booking.
-- search_activities(city, interests, preferences, max_price, party_size, target_date, start_time, wheelchair_accessible): Find tourist attractions and activities.
-- book_activity(activity_id, date, time, party_size): Book a specific activity.
-- cancel_activity(booking_id): Cancel an activity booking.
-- record_surcharge(amount, description): Record a mandatory penalty fee or surcharge from a dynamic event. You MUST call this tool immediately when an event states a rebooking cost or fee, so the system deducts it from your budget.
+Available tools (discovered from the travel MCP server - USE EXACT PARAMETER NAMES):
+{tool_catalog}
+record_surcharge: You MUST call this immediately when an event states a rebooking cost or fee, so the system deducts it from your budget.
 
 """
- 
- 
+
+
+def format_tool_catalog(tools: Optional[List[Dict[str, Any]]]) -> str:
+    """Render MCP tool descriptors (name, description, parameters) as the prompt's tool list."""
+    if not tools:
+        return "- (tool catalog is loaded from the MCP server at runtime)"
+    lines = []
+    for tool in tools:
+        params = ", ".join(tool.get("parameters", []))
+        lines.append(f"- {tool['name']}({params}): {tool.get('description', '').strip()}")
+    return "\n".join(lines)
+
+
+def build_system_prompt(tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    return SYSTEM_PROMPT_TEMPLATE.replace("{tool_catalog}", format_tool_catalog(tools))
+
+
+SYSTEM_PROMPT = build_system_prompt()
+
+
 PLANNING_PROMPT_TEMPLATE = """Plan a trip with these details:
  
 TRIP OVERVIEW:

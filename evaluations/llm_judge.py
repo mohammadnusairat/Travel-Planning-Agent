@@ -1,6 +1,7 @@
 """
 evaluations/llm_judge.py - LLM-as-a-Judge for travel agent output evaluation.
-Uses claude-opus-4-6 to score itineraries across 5 dimensions.
+Uses claude-sonnet-4-6 to score itineraries across 5 dimensions, and records
+judge token usage / API calls so evaluation cost is part of the benchmark report.
 """
 
 import json
@@ -12,6 +13,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO
 from anthropic import Anthropic, APIError
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.core.usage import UsageTracker, usage_from_message
+from src.core.llm_errors import classify_llm_error
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -68,8 +76,9 @@ class JudgeResult:
     overall_score: float
     passed: bool
     pass_threshold: float
-    judge_model: str = "claude-opus-4-6"
+    judge_model: str = "claude-sonnet-4-6"
     raw_judge_response: str = ""
+    usage: Dict[str, Any] = field(default_factory=dict)  # judge api_calls / tokens / estimated cost
 
     def dimensions(self) -> List[DimensionScore]:
         return [
@@ -99,8 +108,13 @@ class JudgeResult:
             f"{'─'*60}",
             f"  Overall Score:                   {self.overall_score:>5.1f}/100",
             f"  Verdict:                         {'PASS' if self.passed else 'FAIL'}",
-            f"{'='*60}",
         ]
+        if self.usage:
+            lines.append(
+                f"  Judge usage:                     {self.usage.get('api_calls', 0)} call(s), "
+                f"{self.usage.get('total_tokens', 0):,} tokens"
+            )
+        lines.append(f"{'='*60}")
         return "\n".join(lines)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -112,6 +126,7 @@ class JudgeResult:
             "passed": self.passed,
             "pass_threshold": self.pass_threshold,
             "judge_model": self.judge_model,
+            "usage": self.usage,
             "dimensions": {
                 dim.name: {
                     "score": dim.score,
@@ -586,7 +601,15 @@ def format_batch_results_table(results: List["JudgeResult"], pairs: Optional[Lis
         ]
         rows.append(average_row)
 
-    return _render_table(headers, rows)
+    table = _render_table(headers, rows)
+    usages = [result.usage for result in results if result.usage]
+    if usages:
+        total_tokens = sum(u.get("total_tokens", 0) for u in usages)
+        api_calls = sum(u.get("api_calls", 0) for u in usages)
+        costs = [u.get("estimated_cost_usd") for u in usages if u.get("estimated_cost_usd") is not None]
+        cost_text = f", est. ${sum(costs):.4f}" if costs else ""
+        table += f"\nJudge usage: {api_calls} API call(s), {total_tokens:,} tokens{cost_text}"
+    return table
 
 
 def format_batch_reasoning_summary(results: List["JudgeResult"], pairs: Optional[List[Dict[str, Any]]] = None) -> str:
@@ -650,6 +673,8 @@ class LLMJudge:
         self.max_conversation_turns = max_conversation_turns
         self.max_tokens = max_tokens
         self._current_itinerary_for_adjustment = ""
+        self.usage = UsageTracker(self.MODEL)        # cumulative across every evaluation
+        self._last_call_usage: Dict[str, Any] = {}
 
     def evaluate(self, task: Dict[str, Any], agent_output: Dict[str, Any]) -> JudgeResult:
         # Validate input structure
@@ -660,9 +685,22 @@ class LLMJudge:
         conversation = agent_output.get("conversation", [])
         self._current_itinerary_for_adjustment = itinerary
         prompt = self._build_prompt(task, itinerary, conversation)
+        calls_before = len(self.usage.llm_calls)
         raw = self._call_judge(prompt)
         parsed = self._parse_response(raw)
-        return self._build_result(task, parsed, raw)
+        result = self._build_result(task, parsed, raw)
+        result.usage = self._usage_since(calls_before)
+        return result
+
+    def _usage_since(self, call_index: int) -> Dict[str, Any]:
+        calls = self.usage.llm_calls[call_index:]
+        scoped = UsageTracker(self.MODEL)
+        scoped.llm_calls = list(calls)
+        summary = scoped.summary()
+        summary.pop("llm_calls")
+        for key in ("tool_calls", "tool_errors", "tool_calls_by_name", "tool_errors_by_name"):
+            summary.pop(key)
+        return summary
 
     def evaluate_batch(
         self,
@@ -709,14 +747,19 @@ class LLMJudge:
         
         for attempt in range(self.MAX_RETRIES):
             try:
+                started = time.time()
                 response = self.client.messages.create(
                     model=self.MODEL,
                     max_tokens=self.max_tokens,
                     system=_SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": user_prompt}],
                 )
+                tokens = usage_from_message(response)
+                self.usage.record_llm_call(tokens["input_tokens"], tokens["output_tokens"], time.time() - started, "judge")
                 return response.content[0].text.strip()
             except APIError as e:
+                if classify_llm_error(e):
+                    raise  # out of credits / bad key: retrying can't help
                 if attempt < self.MAX_RETRIES - 1:
                     delay = self.INITIAL_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"API error (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}. Retrying in {delay}s...")
@@ -777,6 +820,7 @@ class LLMJudge:
             overall_score=overall,
             passed=overall >= self.pass_threshold,
             pass_threshold=self.pass_threshold,
+            judge_model=self.MODEL,
             raw_judge_response=raw,
         )
 

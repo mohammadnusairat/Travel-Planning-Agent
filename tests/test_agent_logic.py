@@ -1196,3 +1196,17 @@ def test_party_size_event_auto_removes_stale_single_person_bookings():
     assert agent.flight_tool.cancelled == ["bk_flight_out"]
     assert agent.hotel_tool.cancelled == ["bk_hotel_1"]
     assert agent.restaurant_tool.cancelled == ["bk_rest_1"]
+
+
+def test_accessible_hotel_requirement_matches_accessible_hotel_in_any_city():
+    agent = make_agent()
+    accessible = {"hotel_name": "Mission Bay Family Resort", "nights": 5, "full_data": {"city": "San Diego", "wheelchair_accessible": True}}
+    agent.tracker.add_booking(Booking(booking_id="bk_hotel_1", type="hotel", details=accessible, cost=995.0))
+
+    assert agent._matched_component_count("hotel_5_nights_wheelchair_accessible") == 5
+
+    agent.tracker.remove_booking("bk_hotel_1")
+    not_accessible = {**accessible, "full_data": {"city": "San Diego", "wheelchair_accessible": False}}
+    agent.tracker.add_booking(Booking(booking_id="bk_hotel_2", type="hotel", details=not_accessible, cost=995.0))
+
+    assert agent._matched_component_count("hotel_5_nights_wheelchair_accessible") == 0

@@ -210,3 +210,9 @@ __marimo__/
 .claude/
 
 .DS_Store
+# Web app
+node_modules/
+data/
+results/
+.env.*
+!.env.example
