@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
 DISRUPTIONS = {
     "none": "No disruption",
     "hotel_unavailable": "Hotel cancels the reservation mid-planning",
@@ -66,6 +68,10 @@ class Catalog:
         self.restaurants = load("restaurants", "restaurants")
         self.flights = load("flights", "flights")
         self.routes: Set[Tuple[str, str]] = {(f["from_city"], f["to_city"]) for f in self.flights}
+        # Weekdays each route has at least one flight (mock flights don't all run daily).
+        self.route_days: Dict[Tuple[str, str], Set[str]] = {}
+        for flight in self.flights:
+            self.route_days.setdefault((flight["from_city"], flight["to_city"]), set()).update(flight["days_available"])
 
     def destination_cities(self) -> List[str]:
         return sorted({h["city"] for h in self.hotels})
@@ -93,6 +99,9 @@ class Catalog:
             "origins": self.origin_cities(),
             "destinations": cities,
             "routes": sorted([list(route) for route in self.routes]),
+            "route_days": sorted(
+                [[a, b, [d for d in WEEKDAYS if d in days]] for (a, b), days in self.route_days.items()]
+            ),
             "interest_suggestions": [tag for tag, _ in tag_counts.most_common(40)],
             "disruptions": DISRUPTIONS,
         }
@@ -112,9 +121,21 @@ class Catalog:
         if problems:
             return problems
         legs = list(zip([origin] + stops, stops + [origin]))
-        for start, end in legs:
+        leg_date = trip.departure_date
+        for index, (start, end) in enumerate(legs):
             if (start, end) not in self.routes:
                 problems.append(f"No direct flight from {start} to {end}.")
+            else:
+                weekday = leg_date.strftime("%A").lower()
+                days = self.route_days[(start, end)]
+                if weekday not in days:
+                    flies = ", ".join(d.capitalize() + "s" for d in WEEKDAYS if d in days)
+                    problems.append(
+                        f"{start} → {end} doesn't fly on {weekday.capitalize()} {leg_date.isoformat()}; "
+                        f"it only flies on {flies}. Adjust the departure date or nights."
+                    )
+            if index < len(trip.destinations):
+                leg_date = leg_date + timedelta(days=trip.destinations[index].nights)
         return problems
 
 

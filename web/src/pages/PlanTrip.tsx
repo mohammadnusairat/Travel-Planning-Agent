@@ -16,12 +16,34 @@ function isoDateInDays(days: number) {
   return d.toISOString().slice(0, 10);
 }
 
-export function routeProblems(origin: string, stops: Stop[], routes: Set<string>): string[] {
+const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** Legs with no direct flight, or whose flights don't run on the day that leg is flown. */
+export function routeProblems(
+  origin: string,
+  stops: Stop[],
+  routes: Set<string>,
+  routeDays: Map<string, string[]> = new Map(),
+  departure?: string,
+): string[] {
   const cities = [origin, ...stops.map((s) => s.city), origin];
   const problems: string[] = [];
+  let legDate = departure ? new Date(`${departure}T12:00:00Z`) : null;
   for (let i = 0; i < cities.length - 1; i++) {
     const [from, to] = [cities[i], cities[i + 1]];
-    if (from && to && !routes.has(`${from}→${to}`)) problems.push(`No direct flight from ${from} to ${to}.`);
+    const key = `${from}→${to}`;
+    if (from && to && !routes.has(key)) {
+      problems.push(`No direct flight from ${from} to ${to}.`);
+    } else if (from && to && legDate && !Number.isNaN(legDate.getTime()) && routeDays.has(key)) {
+      const weekday = WEEKDAYS[legDate.getUTCDay()];
+      const days = routeDays.get(key)!;
+      if (!days.includes(weekday)) {
+        const flies = WEEKDAYS.filter((d) => days.includes(d)).map((d) => `${capitalize(d)}s`).join(", ");
+        problems.push(`${from} → ${to} doesn't fly on ${capitalize(weekday)} ${legDate.toISOString().slice(0, 10)}; it only flies on ${flies}.`);
+      }
+    }
+    if (legDate && i < stops.length) legDate = new Date(legDate.getTime() + stops[i].nights * 86_400_000);
   }
   return problems;
 }
@@ -32,6 +54,7 @@ export default function PlanTrip() {
   const [origin, setOrigin] = useState("Detroit");
   const [stops, setStops] = useState<Stop[]>([{ city: "Chicago", nights: 2 }]);
   const [departure, setDeparture] = useState(isoDateInDays(30));
+  const [departureTouched, setDepartureTouched] = useState(false);
   const [budget, setBudget] = useState(800);
   const [partySize, setPartySize] = useState(1);
   const [interests, setInterests] = useState<string[]>(["live_music"]);
@@ -51,9 +74,22 @@ export default function PlanTrip() {
   }, []);
 
   const routes = useMemo(() => new Set((catalog?.routes ?? []).map(([a, b]) => `${a}→${b}`)), [catalog]);
+  const routeDays = useMemo(() => new Map((catalog?.route_days ?? []).map(([a, b, days]) => [`${a}→${b}`, days])), [catalog]);
   const destinationNames = useMemo(() => (catalog?.destinations ?? []).map((d) => d.name), [catalog]);
   const reachableFrom = (city: string) => destinationNames.filter((d) => routes.has(`${city}→${d}`));
-  const problems = catalog ? routeProblems(origin, stops, routes) : [];
+  const problems = catalog ? routeProblems(origin, stops, routes, routeDays, departure) : [];
+
+  // Until the user picks a date, default to the first one ~30+ days out on which the trip's flights operate.
+  useEffect(() => {
+    if (!catalog || departureTouched) return;
+    for (let offset = 30; offset < 60; offset++) {
+      const candidate = isoDateInDays(offset);
+      if (routeProblems(origin, stops, routes, routeDays, candidate).length === 0) {
+        if (candidate !== departure) setDeparture(candidate);
+        return;
+      }
+    }
+  }, [catalog, departureTouched, origin, stops, routes, routeDays, departure]);
   const nights = stops.reduce((sum, s) => sum + s.nights, 0);
 
   const updateStop = (index: number, patch: Partial<Stop>) =>
@@ -174,7 +210,10 @@ export default function PlanTrip() {
           <div className="row">
             <div className="field">
               <label htmlFor="departure">Departure</label>
-              <input id="departure" type="date" value={departure} onChange={(e) => setDeparture(e.target.value)} required />
+              <input id="departure" type="date" value={departure} onChange={(e) => {
+                setDepartureTouched(true);
+                setDeparture(e.target.value);
+              }} required />
             </div>
             <div className="field">
               <label htmlFor="budget">Budget (USD)</label>

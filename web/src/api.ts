@@ -32,6 +32,8 @@ export interface Catalog {
   origins: string[];
   destinations: CityInfo[];
   routes: [string, string][];
+  /** [from, to, weekdays with at least one flight] */
+  route_days: [string, string, string[]][];
   interest_suggestions: string[];
   disruptions: Record<string, string>;
 }

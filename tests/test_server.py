@@ -380,3 +380,50 @@ def test_database_from_before_error_kind_is_migrated(tmp_path):
 
     store = RunStore(db)
     assert store.list_runs()[0]["error_kind"] is None
+
+
+def test_disruption_events_stream_without_crashing(client):
+    """Regression: firing a disruption with an event callback attached raised
+    TypeError: _emit() got multiple values for argument 'event_type'."""
+    trip = {
+        "origin_city": "Detroit",
+        "destinations": [{"city": "Chicago", "nights": 2}],
+        "departure_date": "2026-02-27",
+        "budget_max": 500,
+        "party_size": 1,
+        "min_activities": 1,
+        "min_restaurants": 0,
+        "disruption": "budget_cut",
+    }
+    run_id = client.post("/api/runs", json={"custom": trip}).json()["id"]
+    events = read_sse(client, run_id)
+    run = wait_for(client, run_id)
+
+    assert run["status"] == "completed", run["error"]
+    disruption = next(e for e in events if e["type"] == "disruption")
+    assert disruption["data"]["event_type"] == "budget_reduced"
+    assert disruption["data"]["budget_max_after"] == 425.0
+    assert disruption["data"]["state"]["budget_max"] == 425.0
+
+
+def test_trip_whose_flights_dont_run_that_day_is_rejected_up_front(client):
+    """The failed production trip: out Sunday 2026-11-08, back Tuesday, but Chicago -> Detroit only flies Sun/Mon."""
+    trip = {
+        "origin_city": "Detroit",
+        "destinations": [{"city": "Chicago", "nights": 2}],
+        "departure_date": "2026-11-08",
+        "budget_max": 800,
+        "party_size": 1,
+    }
+    response = client.post("/api/runs", json={"custom": trip})
+    assert response.status_code == 422
+    assert response.json()["detail"]["problems"] == [
+        "Chicago → Detroit doesn't fly on Tuesday 2026-11-10; it only flies on Mondays, Sundays. Adjust the departure date or nights."
+    ]
+    assert client.get("/api/runs").json() == []  # nothing was started, so nothing was spent
+
+    trip["destinations"][0]["nights"] = 1  # back Monday: flights operate
+    assert client.post("/api/runs", json={"custom": trip}).status_code == 201
+
+    route_days = {(a, b): days for a, b, days in client.get("/api/catalog").json()["route_days"]}
+    assert route_days[("Chicago", "Detroit")] == ["monday", "sunday"]

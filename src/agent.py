@@ -95,7 +95,8 @@ class TravelAgent:
         """Ask a running plan_trip to finish after the current step (renders what is booked so far)."""
         self._stop_requested = True
 
-    def _emit(self, event_type: str, **payload: Any) -> None:
+    def _emit(self, event_type: str, /, **payload: Any) -> None:
+        """event_type is positional-only so payloads can carry their own "event_type" field (disruptions do)."""
         callback = getattr(self, "event_callback", None)
         if callback is None:
             return

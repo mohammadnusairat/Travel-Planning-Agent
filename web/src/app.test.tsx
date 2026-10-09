@@ -23,6 +23,15 @@ describe("routeProblems", () => {
     expect(routeProblems("Detroit", [{ city: "Chicago", nights: 2 }], routes)).toEqual([]);
   });
 
+  it("reports legs whose flights don't run on that day", () => {
+    const days = new Map([["Detroit→Chicago", ["friday", "saturday", "sunday"]], ["Chicago→Detroit", ["sunday", "monday"]]]);
+    // Sunday 2026-11-08 out, back Tuesday 2026-11-10: the return doesn't operate on Tuesdays
+    expect(routeProblems("Detroit", [{ city: "Chicago", nights: 2 }], routes, days, "2026-11-08")).toEqual([
+      "Chicago → Detroit doesn't fly on Tuesday 2026-11-10; it only flies on Sundays, Mondays.",
+    ]);
+    expect(routeProblems("Detroit", [{ city: "Chicago", nights: 1 }], routes, days, "2026-11-08")).toEqual([]);
+  });
+
   it("reports legs with no direct flight, including the way home", () => {
     expect(routeProblems("Detroit", [{ city: "Chicago", nights: 2 }, { city: "Miami", nights: 2 }], routes)).toEqual([
       "No direct flight from Miami to Detroit.",
